@@ -1,102 +1,93 @@
-const {makeid} = require('./id');
+const { makeid } = require('./id');
 const QRCode = require('qrcode');
 const express = require('express');
-const path = require('path');
 const fs = require('fs');
-let router = express.Router()
-const pino = require("pino");
-function removeFile(FilePath) {
-        if (!fs.existsSync(FilePath)) return false;
-        fs.rmSync(FilePath, {
-                recursive: true,
-                force: true
-        })
-};
-const {
-        readFile
-} = require("node:fs/promises")
-router.get('/', async (req, res) => {
-        const id = makeid();
-        async function JUNEX_QR_CODE() {
-                try {
-                        const {
-                                default: Junex,
-                                useMultiFileAuthState,
-                                Browsers,
-                                delay,
-                        } = await import('@whiskeysockets/baileys');
-                const {
-                        state,
-                        saveCreds
-                } = await useMultiFileAuthState('./temp/' + id)
-                        let JunexSocket = Junex({
-                                auth: state,
-                                printQRInTerminal: false,
-                                logger: pino({
-                                        level: "silent"
-                                }),
-                                browser: Browsers.macOS("Desktop"),
-                        });
+const path = require('path');
+const pino = require('pino');
 
-                        JunexSocket.ev.on('creds.update', saveCreds)
-                        JunexSocket.ev.on("connection.update", async (s) => {
-                                const {
-                                        connection,
-                                        lastDisconnect,
-                                        qr
-                                } = s;
-                                if (qr && !res.headersSent) {
-                                        res.type('png').set('Cache-Control', 'no-store, private').send(await QRCode.toBuffer(qr));
-                                }
-                                if (connection == "open") {
-                                        await delay(5000);
-                                        let data = fs.readFileSync(__dirname + `/temp/${id}/creds.json`);
-                                        await delay(800);
-                                   let b64data = Buffer.from(data).toString('base64');
-                                   let session = await JunexSocket.sendMessage(JunexSocket.user.id, { text: 'June-X:-' + b64data });
+const router = express.Router();
+const TEMP_ROOT = path.join(__dirname, 'temp');
+const logger = pino({ level: process.env.LOG_LEVEL || 'silent' });
 
-                                   let JUNEX_SESSION_TEXT = `
-╔════════════════════◇
-║『 SESSION CONNECTED』
-╚════════════════════╝
+function sessionPath(id) {
+  return path.join(TEMP_ROOT, id);
+}
 
+function removeSession(id) {
+  fs.rmSync(sessionPath(id), { recursive: true, force: true });
+}
 
----
+function disconnectStatus(error) {
+  return error?.output?.statusCode || error?.statusCode || error?.data?.statusCode;
+}
 
-╔════════════════════◇
-║『 YOU'VE CHOSEN Dave session』
-║ -Set the session ID in Heroku:
-║ - SESSION_ID: 
-╚════════════════════╝
-𒂀 Enjoy VolTah MD
+router.get('/', async (_req, res) => {
+  const id = makeid(8);
+  const authPath = sessionPath(id);
 
+  try {
+    const {
+      default: makeWASocket,
+      useMultiFileAuthState,
+      makeCacheableSignalKeyStore,
+      Browsers,
+      DisconnectReason,
+    } = await import('@whiskeysockets/baileys');
 
----
+    fs.mkdirSync(TEMP_ROOT, { recursive: true });
+    const { state, saveCreds } = await useMultiFileAuthState(authPath);
+    const socket = makeWASocket({
+      auth: {
+        creds: state.creds,
+        keys: makeCacheableSignalKeyStore(state.keys, logger),
+      },
+      browser: Browsers.macOS('Desktop'),
+      printQRInTerminal: false,
+      logger,
+    });
 
-Don't Forget To Give Star⭐ To My Repo
-______________________________`;
-         await JunexSocket.sendMessage(JunexSocket.user.id,{text:JUNEX_SESSION_TEXT},{quoted:session})
-
-
-
-                                        await delay(100);
-                                        await JunexSocket.ws.close();
-                                        return await removeFile("temp/" + id);
-                                } else if (connection === "close" && lastDisconnect && lastDisconnect.error && lastDisconnect.error.output.statusCode != 401) {
-                                        await delay(10000);
-                                        JUNEX_QR_CODE();
-                                }
-                        });
-                } catch (err) {
-                        if (!res.headersSent) {
-                                res.status(503).json({
-                                        code: "Service is Currently Unavailable"
-                                });
-                        }
-                        console.log(err);
-                        await removeFile("temp/" + id);
-                }
+    socket.ev.on('creds.update', saveCreds);
+    socket.ev.on('connection.update', async ({ connection, qr, lastDisconnect }) => {
+      if (qr && !res.headersSent) {
+        try {
+          const png = await QRCode.toBuffer(qr, { type: 'png', margin: 2, width: 480 });
+          res.status(200)
+            .type('png')
+            .set({ 'Cache-Control': 'no-store, private, max-age=0', Pragma: 'no-cache' })
+            .send(png);
+        } catch (error) {
+          console.error('[qr] QR rendering failed:', error);
+          if (!res.headersSent) res.status(500).json({ code: 'QR rendering failed' });
         }
-        return await JUNEX_QR_CODE()
+      }
+
+      if (connection === 'open') {
+        try {
+          await new Promise(resolve => setTimeout(resolve, 2500));
+          const credsFile = path.join(authPath, 'creds.json');
+          if (!fs.existsSync(credsFile)) throw new Error('WhatsApp credentials were not saved');
+          const session = Buffer.from(fs.readFileSync(credsFile)).toString('base64');
+          const sent = await socket.sendMessage(socket.user.id, { text: `June-X:-${session}` });
+          await socket.sendMessage(socket.user.id, {
+            text: '✅ Session connected successfully\n⚙️ Type: Base64\nstatus: 🟢 online',
+          }, { quoted: sent });
+        } catch (error) {
+          console.error('[qr] session delivery failed:', error.message);
+        } finally {
+          setTimeout(() => {
+            socket.ws?.close();
+            removeSession(id);
+          }, 100);
+        }
+      } else if (connection === 'close' && disconnectStatus(lastDisconnect?.error) === DisconnectReason.loggedOut) {
+        removeSession(id);
+      }
+    });
+  } catch (error) {
+    console.error('[qr] QR generation failed:', error);
+    removeSession(id);
+    if (!res.headersSent) res.status(503).json({ code: 'Service is Currently Unavailable' });
+  }
 });
-module.exports = router
+
+module.exports = router;
